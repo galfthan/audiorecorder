@@ -314,21 +314,21 @@ func main() {
 	copy(speakerChunksCopy, speakerChunks)
 	audioMutex.Unlock()
 
-	// Save microphone recording (flattened, not synchronized)
-	if len(micChunksCopy) > 0 {
-		micFile := filepath.Join(outputFolder, fmt.Sprintf("mic_%s.wav", timestamp))
-		fmt.Println("Saving microphone recording to:", micFile)
-		flattenedMicSamples := flattenChunks(micChunksCopy)
-		saveWAV(micFile, flattenedMicSamples, sampleRate, channels)
-	}
+	// // Save microphone recording (flattened, not synchronized)
+	// if len(micChunksCopy) > 0 {
+	// 	micFile := filepath.Join(outputFolder, fmt.Sprintf("mic_%s.wav", timestamp))
+	// 	fmt.Println("Saving microphone recording to:", micFile)
+	// 	flattenedMicSamples := flattenChunks(micChunksCopy)
+	// 	saveWAV(micFile, flattenedMicSamples, sampleRate, channels)
+	// }
 
-	// Save speaker recording if available (flattened, not synchronized)
-	if speakerActive && len(speakerChunksCopy) > 0 {
-		speakerFile := filepath.Join(outputFolder, fmt.Sprintf("speaker_%s.wav", timestamp))
-		fmt.Println("Saving speaker recording to:", speakerFile)
-		flattenedSpeakerSamples := flattenChunks(speakerChunksCopy)
-		saveWAV(speakerFile, flattenedSpeakerSamples, sampleRate, channels)
-	}
+	// // Save speaker recording if available (flattened, not synchronized)
+	// if speakerActive && len(speakerChunksCopy) > 0 {
+	// 	speakerFile := filepath.Join(outputFolder, fmt.Sprintf("speaker_%s.wav", timestamp))
+	// 	fmt.Println("Saving speaker recording to:", speakerFile)
+	// 	flattenedSpeakerSamples := flattenChunks(speakerChunksCopy)
+	// 	saveWAV(speakerFile, flattenedSpeakerSamples, sampleRate, channels)
+	// }
 
 	// Create synchronized mixed recording
 	mixedFile := filepath.Join(outputFolder, fmt.Sprintf("mixed_%s.wav", timestamp))
