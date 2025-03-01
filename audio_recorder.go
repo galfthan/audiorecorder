@@ -7,11 +7,20 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gen2brain/malgo"
 )
+
+// AudioChunk represents a chunk of audio data with a timestamp
+type AudioChunk struct {
+	Samples    []float32
+	Timestamp  time.Time
+	SampleRate int
+	Channels   int
+}
 
 func main() {
 	// Create output folder in user's home directory
@@ -21,28 +30,75 @@ func main() {
 
 	// Initialize audio context
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
-		fmt.Println(message)
+		fmt.Println("AUDIO:", message)
 	})
 	if err != nil {
 		fmt.Println("Failed to initialize audio context:", err)
-		os.Exit(1)
+		fmt.Println("Press Enter to exit...")
+		fmt.Scanln()
+		return
 	}
 	defer ctx.Free()
 
-	fmt.Println("Windows Audio Recorder")
-	fmt.Println("---------------------")
-	fmt.Println("Recording will be saved to:", outputFolder)
+	fmt.Println("Windows Audio Recorder (Clean Audio + Sync)")
+	fmt.Println("----------------------------------------")
+
+	// List available audio devices
+	fmt.Println("\nAVAILABLE MICROPHONES:")
+	captureDevices, err := ctx.Devices(malgo.Capture)
+	if err != nil {
+		fmt.Println("Error listing capture devices:", err)
+	} else if len(captureDevices) == 0 {
+		fmt.Println("No capture devices found!")
+	} else {
+		for i, device := range captureDevices {
+			fmt.Printf("%d: %s\n", i, device.Name())
+		}
+	}
+
+	fmt.Println("\nAVAILABLE SPEAKERS (LOOPBACK):")
+	loopbackDevices, err := ctx.Devices(malgo.Loopback)
+	if err != nil {
+		fmt.Println("Error listing loopback devices:", err)
+	} else if len(loopbackDevices) == 0 {
+		fmt.Println("No loopback devices found!")
+	} else {
+		for i, device := range loopbackDevices {
+			fmt.Printf("%d: %s\n", i, device.Name())
+		}
+	}
+
+	// Ask user to select microphone device
+	var micDeviceIndex int
+	if len(captureDevices) > 1 {
+		fmt.Print("\nSelect microphone by number (or press Enter for default): ")
+		input := ""
+		fmt.Scanln(&input)
+		if input != "" {
+			fmt.Sscanf(input, "%d", &micDeviceIndex)
+			if micDeviceIndex < 0 || micDeviceIndex >= len(captureDevices) {
+				fmt.Println("Invalid selection, using default device.")
+				micDeviceIndex = 0
+			}
+		}
+	}
+
+	fmt.Println("\nRecording will be saved to:", outputFolder)
 	fmt.Println("Press Ctrl+C to stop recording and save...")
 
-	// Set up channels to store audio data
-	micSamples := make([][]float32, 0)
-	speakerSamples := make([][]float32, 0)
-
-	// Audio settings
+	// Audio settings - use original parameters
 	sampleRate := 44100
 	channels := 2
 
-	// Set up microphone recording
+	// Create channels to store audio data
+	var micChunks []AudioChunk
+	var speakerChunks []AudioChunk
+	var audioMutex sync.Mutex
+
+	// Record the exact recording start time
+	recordingStartTime := time.Now()
+
+	// Set up microphone recording with specific device
 	micConfig := malgo.DeviceConfig{
 		DeviceType: malgo.Capture,
 		SampleRate: uint32(sampleRate),
@@ -51,6 +107,82 @@ func main() {
 			Channels: uint32(channels),
 		},
 	}
+
+	// Set specific device if user selected one
+	if len(captureDevices) > 0 {
+		selectedDevice := captureDevices[micDeviceIndex]
+		fmt.Printf("Using microphone: %s\n", selectedDevice.Name())
+		micConfig.Capture.DeviceID = selectedDevice.ID.Pointer()
+	}
+
+	// Variables for microphone level monitoring
+	var micLevel float32
+	var micMutex sync.Mutex
+
+	// Start recording microphone
+	micDevice, err := malgo.InitDevice(ctx.Context, micConfig, malgo.DeviceCallbacks{
+		Data: func(output, input []byte, frameCount uint32) {
+			// Get the current time for this chunk
+			chunkTime := time.Now()
+
+			// Calculate audio level from this batch
+			level := float32(0)
+
+			// Convert input bytes to float32 slice - simple, direct conversion
+			samplesF32 := make([]float32, frameCount*uint32(channels))
+			for i := 0; i < int(frameCount*uint32(channels)); i++ {
+				if i*4+3 < len(input) {
+					var value float32
+					binary.Read(bytes.NewReader(input[i*4:i*4+4]), binary.LittleEndian, &value)
+					samplesF32[i] = value
+
+					// Calculate level (absolute value)
+					absValue := float32(0)
+					if value < 0 {
+						absValue = -value
+					} else {
+						absValue = value
+					}
+					level += absValue
+				}
+			}
+
+			// Normalize level
+			if frameCount > 0 {
+				level = level / float32(frameCount*uint32(channels))
+			}
+
+			// Update level safely
+			micMutex.Lock()
+			micLevel = level
+			micMutex.Unlock()
+
+			// Store the chunk with its timestamp
+			audioMutex.Lock()
+			micChunks = append(micChunks, AudioChunk{
+				Samples:    samplesF32,
+				Timestamp:  chunkTime,
+				SampleRate: sampleRate,
+				Channels:   int(channels),
+			})
+			audioMutex.Unlock()
+		},
+	})
+	if err != nil {
+		fmt.Println("Failed to initialize microphone:", err)
+		fmt.Println("Press Enter to exit...")
+		fmt.Scanln()
+		return
+	}
+
+	if err = micDevice.Start(); err != nil {
+		fmt.Println("Failed to start microphone:", err)
+		micDevice.Uninit()
+		fmt.Println("Press Enter to exit...")
+		fmt.Scanln()
+		return
+	}
+	defer micDevice.Uninit()
 
 	// Set up speaker recording (loopback)
 	speakerConfig := malgo.DeviceConfig{
@@ -62,37 +194,14 @@ func main() {
 		},
 	}
 
-	// Start recording microphone
-	micDevice, err := malgo.InitDevice(ctx.Context, micConfig, malgo.DeviceCallbacks{
-		Data: func(output, input []byte, frameCount uint32) {
-			// Convert input bytes to float32 slice
-			samplesF32 := make([]float32, frameCount*uint32(channels))
-			for i := 0; i < int(frameCount*uint32(channels)); i++ {
-				if i*4+3 < len(input) {
-					var value float32
-					binary.Read(bytes.NewReader(input[i*4:i*4+4]), binary.LittleEndian, &value)
-					samplesF32[i] = value
-				}
-			}
-			micSamples = append(micSamples, samplesF32)
-		},
-	})
-	if err != nil {
-		fmt.Println("Failed to initialize microphone:", err)
-		os.Exit(1)
-	}
-
-	if err = micDevice.Start(); err != nil {
-		fmt.Println("Failed to start microphone:", err)
-		micDevice.Uninit()
-		os.Exit(1)
-	}
-	defer micDevice.Uninit()
-
-	// Start recording speakers
+	// Try to start recording speakers
+	var speakerActive bool
 	speakerDevice, err := malgo.InitDevice(ctx.Context, speakerConfig, malgo.DeviceCallbacks{
 		Data: func(output, input []byte, frameCount uint32) {
-			// Convert input bytes to float32 slice
+			// Get the current time for this chunk
+			chunkTime := time.Now()
+
+			// Convert input bytes to float32 slice - simple, direct conversion
 			samplesF32 := make([]float32, frameCount*uint32(channels))
 			for i := 0; i < int(frameCount*uint32(channels)); i++ {
 				if i*4+3 < len(input) {
@@ -101,35 +210,82 @@ func main() {
 					samplesF32[i] = value
 				}
 			}
-			speakerSamples = append(speakerSamples, samplesF32)
+
+			// Store the chunk with its timestamp
+			audioMutex.Lock()
+			speakerChunks = append(speakerChunks, AudioChunk{
+				Samples:    samplesF32,
+				Timestamp:  chunkTime,
+				SampleRate: sampleRate,
+				Channels:   int(channels),
+			})
+			audioMutex.Unlock()
 		},
 	})
 	if err != nil {
 		fmt.Println("Failed to initialize speaker:", err)
-		micDevice.Stop()
-		micDevice.Uninit()
-		os.Exit(1)
+		fmt.Println("Will continue with microphone only.")
+	} else {
+		if err = speakerDevice.Start(); err != nil {
+			fmt.Println("Failed to start speaker:", err)
+			speakerDevice.Uninit()
+			fmt.Println("Will continue with microphone only.")
+		} else {
+			defer speakerDevice.Uninit()
+			speakerActive = true
+		}
 	}
 
-	if err = speakerDevice.Start(); err != nil {
-		fmt.Println("Failed to start speaker:", err)
-		micDevice.Stop()
-		micDevice.Uninit()
-		speakerDevice.Uninit()
-		os.Exit(1)
-	}
-	defer speakerDevice.Uninit()
-
-	// Print recording status
+	// Print recording status with microphone level indicator
 	startTime := time.Now()
+	stopRecording := make(chan bool)
+
 	go func() {
 		for {
-			elapsed := time.Since(startTime)
-			fmt.Printf("\rRecording... %02d:%02d:%02d",
-				int(elapsed.Hours()),
-				int(elapsed.Minutes())%60,
-				int(elapsed.Seconds())%60)
-			time.Sleep(1 * time.Second)
+			select {
+			case <-stopRecording:
+				return
+			default:
+				elapsed := time.Since(startTime)
+
+				// Get current mic level safely
+				micMutex.Lock()
+				currentLevel := micLevel
+				micMutex.Unlock()
+
+				// Create audio level meter
+				const meterWidth = 20
+				level := int(currentLevel * 100)
+				if level > 100 {
+					level = 100
+				}
+				bar := int(level * meterWidth / 100)
+
+				meter := "["
+				for i := 0; i < meterWidth; i++ {
+					if i < bar {
+						meter += "#"
+					} else {
+						meter += " "
+					}
+				}
+				meter += "]"
+
+				// Show recording stats
+				audioMutex.Lock()
+				micCount := len(micChunks)
+				speakerCount := len(speakerChunks)
+				audioMutex.Unlock()
+
+				fmt.Printf("\rRecording... %02d:%02d:%02d  Mic: %s %d%%  Chunks: Mic=%d Spk=%d",
+					int(elapsed.Hours()),
+					int(elapsed.Minutes())%60,
+					int(elapsed.Seconds())%60,
+					meter, level,
+					micCount, speakerCount)
+
+				time.Sleep(100 * time.Millisecond)
+			}
 		}
 	}()
 
@@ -140,69 +296,175 @@ func main() {
 
 	// Stop recording
 	fmt.Println("\nStopping recording...")
+	close(stopRecording)
 	micDevice.Stop()
-	speakerDevice.Stop()
-
-	// Mix the audio and save to WAV file
-	fmt.Println("Mixing audio...")
-	mixedSamples := mixAudio(micSamples, speakerSamples)
-
-	// Create filename with timestamp
-	timestamp := time.Now().Format("20060102_150405")
-	outputFile := filepath.Join(outputFolder, fmt.Sprintf("recording_%s.wav", timestamp))
-
-	// Save to WAV file
-	fmt.Println("Saving to", outputFile)
-	err = saveWAV(outputFile, mixedSamples, sampleRate, channels)
-	if err != nil {
-		fmt.Println("Error saving WAV file:", err)
-		os.Exit(1)
+	if speakerActive {
+		speakerDevice.Stop()
 	}
 
-	fmt.Println("Recording saved successfully!")
+	// Save both mic and speaker recordings separately by flattening chunks
+	timestamp := time.Now().Format("20060102_150405")
+
+	// Copy chunks safely
+	audioMutex.Lock()
+	micChunksCopy := make([]AudioChunk, len(micChunks))
+	copy(micChunksCopy, micChunks)
+
+	speakerChunksCopy := make([]AudioChunk, len(speakerChunks))
+	copy(speakerChunksCopy, speakerChunks)
+	audioMutex.Unlock()
+
+	// Save microphone recording (flattened, not synchronized)
+	if len(micChunksCopy) > 0 {
+		micFile := filepath.Join(outputFolder, fmt.Sprintf("mic_%s.wav", timestamp))
+		fmt.Println("Saving microphone recording to:", micFile)
+		flattenedMicSamples := flattenChunks(micChunksCopy)
+		saveWAV(micFile, flattenedMicSamples, sampleRate, channels)
+	}
+
+	// Save speaker recording if available (flattened, not synchronized)
+	if speakerActive && len(speakerChunksCopy) > 0 {
+		speakerFile := filepath.Join(outputFolder, fmt.Sprintf("speaker_%s.wav", timestamp))
+		fmt.Println("Saving speaker recording to:", speakerFile)
+		flattenedSpeakerSamples := flattenChunks(speakerChunksCopy)
+		saveWAV(speakerFile, flattenedSpeakerSamples, sampleRate, channels)
+	}
+
+	// Create synchronized mixed recording
+	mixedFile := filepath.Join(outputFolder, fmt.Sprintf("mixed_%s.wav", timestamp))
+	fmt.Println("Creating synchronized mixed recording...")
+	createSynchronizedMix(mixedFile, micChunksCopy, speakerChunksCopy, recordingStartTime, sampleRate, channels)
+
+	fmt.Println("All recordings saved successfully!")
+	fmt.Println("Press Enter to exit...")
+	fmt.Scanln()
 }
 
-// mixAudio mixes microphone and speaker audio
-func mixAudio(micSamples, speakerSamples [][]float32) []float32 {
-	// Determine the shorter of the two
-	minLength := len(micSamples)
-	if len(speakerSamples) < minLength {
-		minLength = len(speakerSamples)
+// flattenChunks combines multiple audio chunks into a single sample array
+func flattenChunks(chunks []AudioChunk) []float32 {
+	if len(chunks) == 0 {
+		return nil
 	}
 
-	// Calculate the total number of samples
+	// Calculate total samples
 	totalSamples := 0
-	for i := 0; i < minLength; i++ {
-		micLen := len(micSamples[i])
-		speakerLen := len(speakerSamples[i])
-		shorter := micLen
-		if speakerLen < shorter {
-			shorter = speakerLen
-		}
-		totalSamples += shorter
+	for _, chunk := range chunks {
+		totalSamples += len(chunk.Samples)
 	}
 
-	// Create the mixed samples array
-	mixed := make([]float32, totalSamples)
-	sampleIndex := 0
+	// Create combined sample array
+	allSamples := make([]float32, 0, totalSamples)
 
-	// Mix the samples
-	for i := 0; i < minLength; i++ {
-		micLen := len(micSamples[i])
-		speakerLen := len(speakerSamples[i])
-		shorter := micLen
-		if speakerLen < shorter {
-			shorter = speakerLen
-		}
+	// Append all samples in order
+	for _, chunk := range chunks {
+		allSamples = append(allSamples, chunk.Samples...)
+	}
 
-		for j := 0; j < shorter; j++ {
-			// Simple mix - average the mic and speaker samples
-			mixed[sampleIndex] = (micSamples[i][j] + speakerSamples[i][j]) / 2.0
-			sampleIndex++
+	return allSamples
+}
+
+// createSynchronizedMix creates a synchronized mix of microphone and speaker audio
+// This version uses a simpler approach with minimal processing to maintain quality
+func createSynchronizedMix(filePath string, micChunks, speakerChunks []AudioChunk,
+	startTime time.Time, sampleRate, channels int) error {
+
+	// If we don't have both types of chunks, fall back to just one
+	if len(micChunks) == 0 && len(speakerChunks) == 0 {
+		return fmt.Errorf("no audio data available")
+	} else if len(micChunks) == 0 {
+		fmt.Println("Using speaker audio only for mix (no microphone data)")
+		flattenedSpeakerSamples := flattenChunks(speakerChunks)
+		return saveWAV(filePath, flattenedSpeakerSamples, sampleRate, channels)
+	} else if len(speakerChunks) == 0 {
+		fmt.Println("Using microphone audio only for mix (no speaker data)")
+		flattenedMicSamples := flattenChunks(micChunks)
+		return saveWAV(filePath, flattenedMicSamples, sampleRate, channels)
+	}
+
+	// Simplified synchronization approach:
+	// 1. Sort chunks by timestamp
+	// 2. Calculate offset between first mic and speaker chunk
+	// 3. Apply this offset to create properly synchronized mix
+
+	// Find the earliest timestamp for each stream
+	var firstMicTime, firstSpeakerTime time.Time
+
+	if len(micChunks) > 0 {
+		firstMicTime = micChunks[0].Timestamp
+	}
+
+	if len(speakerChunks) > 0 {
+		firstSpeakerTime = speakerChunks[0].Timestamp
+	}
+
+	// Calculate time offset between streams in samples
+	var offsetSamples int
+	samplesPerMs := float64(sampleRate*channels) / 1000.0
+
+	if firstMicTime.Before(firstSpeakerTime) {
+		// Mic started first
+		offsetMs := firstSpeakerTime.Sub(firstMicTime).Milliseconds()
+		offsetSamples = int(float64(offsetMs) * samplesPerMs)
+		fmt.Printf("Speaker started %.1f ms after microphone\n", float64(offsetMs))
+	} else {
+		// Speaker started first
+		offsetMs := firstMicTime.Sub(firstSpeakerTime).Milliseconds()
+		offsetSamples = -int(float64(offsetMs) * samplesPerMs)
+		fmt.Printf("Microphone started %.1f ms after speaker\n", float64(offsetMs))
+	}
+
+	// Flatten both streams
+	flatMicSamples := flattenChunks(micChunks)
+	flatSpeakerSamples := flattenChunks(speakerChunks)
+
+	// Calculate total length needed
+	totalLength := len(flatMicSamples)
+	if len(flatSpeakerSamples)+abs(offsetSamples) > totalLength {
+		totalLength = len(flatSpeakerSamples) + abs(offsetSamples)
+	}
+
+	// Create mixed buffer
+	mixedSamples := make([]float32, totalLength)
+
+	// Copy microphone samples
+	micStart := 0
+	if offsetSamples < 0 {
+		// If mic started after speaker, adjust start position
+		micStart = abs(offsetSamples)
+	}
+
+	for i := 0; i < len(flatMicSamples); i++ {
+		pos := micStart + i
+		if pos < len(mixedSamples) {
+			mixedSamples[pos] = flatMicSamples[i]
 		}
 	}
 
-	return mixed
+	// Mix in speaker samples
+	speakerStart := 0
+	if offsetSamples > 0 {
+		// If speaker started after mic, adjust start position
+		speakerStart = offsetSamples
+	}
+
+	for i := 0; i < len(flatSpeakerSamples); i++ {
+		pos := speakerStart + i
+		if pos < len(mixedSamples) {
+			// Simple mix - add half of each (avoid clipping)
+			mixedSamples[pos] = (mixedSamples[pos] + flatSpeakerSamples[i]) * 0.5
+		}
+	}
+
+	// Save the mixed file
+	return saveWAV(filePath, mixedSamples, sampleRate, channels)
+}
+
+// abs returns the absolute value of an integer
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // saveWAV saves audio data to a WAV file
