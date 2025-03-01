@@ -7,7 +7,6 @@ require (
 	github.com/getlantern/systray v1.2.2
 	github.com/go-ole/go-ole v1.3.0
 	github.com/lxn/walk v0.0.0-20210112085537-c389da54e794
-	github.com/moutend/go-wav v0.0.0-20170820031854-56127fbbb7ba
 )
 
 require (

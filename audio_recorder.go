@@ -5,21 +5,21 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"bytes"
+	"encoding/binary"
 
 	"github.com/gen2brain/malgo"
 	"github.com/getlantern/systray"
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
 	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
-	"github.com/moutend/go-wav"
 )
 
 type AudioRecorder struct {
 	isRecording      bool
 	startTime        time.Time
 	outputFolder     string
-	ctx              *malgo.AllocatedContext
+	ctx              *malgo.Context
 	recordingDevices []malgo.DeviceInfo
 	playbackDevices  []malgo.DeviceInfo
 	capturedSamples  [][]float32
@@ -38,8 +38,14 @@ func main() {
 	// Create recorder instance
 	recorder := NewAudioRecorder()
 
-	// Start the UI
-	systray.Run(recorder.onSystrayReady, recorder.onSystrayExit)
+	// Start the UI in the main thread
+	recorder.createAndShowMainWindow()
+
+	// Start the systray after the window is created
+	go systray.Run(recorder.onSystrayReady, recorder.onSystrayExit)
+
+	// Start the main window loop
+	recorder.mainWindow.Run()
 }
 
 // NewAudioRecorder creates and initializes a new AudioRecorder instance
@@ -50,7 +56,9 @@ func NewAudioRecorder() *AudioRecorder {
 	os.MkdirAll(outputFolder, 0755)
 
 	// Create audio context
-	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
+		fmt.Println(message)
+	})
 	if err != nil {
 		fmt.Println("Failed to initialize audio context:", err)
 		os.Exit(1)
@@ -80,15 +88,16 @@ func NewAudioRecorder() *AudioRecorder {
 }
 
 // getAudioDevices retrieves available audio devices
-func getAudioDevices(ctx *malgo.AllocatedContext, deviceType malgo.DeviceType) ([]malgo.DeviceInfo, error) {
-	infos, err := ctx.Devices(deviceType)
+func getAudioDevices(ctx *malgo.Context, deviceType malgo.DeviceType) ([]malgo.DeviceInfo, error) {
+	// Get device info
+	deviceInfos, err := ctx.Devices(deviceType)
 	if err != nil {
 		return nil, err
 	}
-	return infos, nil
+	return deviceInfos, nil
 }
 
-// onSystrayReady initializes the system tray icon and user interface
+// onSystrayReady initializes the system tray icon and menu
 func (ar *AudioRecorder) onSystrayReady() {
 	// Set system tray icon and menu
 	systray.SetIcon(getIconData())
@@ -103,117 +112,122 @@ func (ar *AudioRecorder) onSystrayReady() {
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Quit the app")
 
-	// Launch the UI in a separate goroutine
-	go ar.createAndShowMainWindow()
-
 	// Handle system tray menu actions
-	for {
-		select {
-		case <-mShow.ClickedCh:
-			ar.showMainWindow()
-		case <-mStartRecording.ClickedCh:
-			if !ar.isRecording {
-				ar.startRecording()
-				mStartRecording.Disable()
-				mStopRecording.Enable()
+	go func() {
+		for {
+			select {
+			case <-mShow.ClickedCh:
+				ar.showMainWindow()
+			case <-mStartRecording.ClickedCh:
+				if !ar.isRecording {
+					ar.startRecording()
+					mStartRecording.Disable()
+					mStopRecording.Enable()
+				}
+			case <-mStopRecording.ClickedCh:
+				if ar.isRecording {
+					ar.stopRecording()
+					mStartRecording.Enable()
+					mStopRecording.Disable()
+				}
+			case <-mQuit.ClickedCh:
+				if ar.isRecording {
+					ar.stopRecording()
+				}
+				systray.Quit()
+				ar.mainWindow.Close()
+				return
 			}
-		case <-mStopRecording.ClickedCh:
-			if ar.isRecording {
-				ar.stopRecording()
-				mStartRecording.Enable()
-				mStopRecording.Disable()
-			}
-		case <-mQuit.ClickedCh:
-			if ar.isRecording {
-				ar.stopRecording()
-			}
-			systray.Quit()
-			return
 		}
-	}
+	}()
 }
 
 // onSystrayExit handles cleanup when the system tray is exited
 func (ar *AudioRecorder) onSystrayExit() {
-	if ar.ctx != nil {
-		ar.ctx.Uninit()
-		ar.ctx.Free()
-	}
+	ar.ctx.Uninit()
+	os.Exit(0)
 }
 
 // createAndShowMainWindow creates and displays the main application window
 func (ar *AudioRecorder) createAndShowMainWindow() {
-	var err error
-
-	// Create the main window
-	ar.mainWindow, err = MainWindow{
-		AssignTo: &ar.mainWindow,
-		Title:     "Windows Audio Recorder",
-		MinSize:   Size{Width: 400, Height: 300},
-		Layout:    VBox{},
-		Children: []Widget{
-			PushButton{
-				AssignTo: &ar.recordButton,
-				Text:     "Start Recording",
-				OnClicked: func() {
-					ar.toggleRecording()
-				},
-			},
-			GroupBox{
-				Title:  "Status",
-				Layout: VBox{},
-				Children: []Widget{
-					Label{
-						AssignTo: &ar.statusLabel,
-						Text:     "Ready",
-					},
-				},
-			},
-			Label{
-				AssignTo: &ar.timeLabel,
-				Text:     "00:00:00",
-			},
-			GroupBox{
-				Title:  "Settings",
-				Layout: VBox{},
-				Children: []Widget{
-					CheckBox{
-						AssignTo: &ar.autoStartCheck,
-						Text:     "Start with Windows",
-						OnCheckedChanged: func() {
-							ar.toggleAutoStart()
-						},
-					},
-				},
-			},
-		},
-		OnSizeChanged: func() {
-			// Check if window is minimized
-			if ar.mainWindow.Visible() && ar.mainWindow.WindowState() == walk.WindowMinimized {
-				ar.mainWindow.Hide()
-			}
-		},
-	}.Create()
-
+	// Create a new main window
+	mainWindow, err := walk.NewMainWindow()
 	if err != nil {
 		fmt.Println("Error creating main window:", err)
 		return
 	}
+	ar.mainWindow = mainWindow
+
+	// Set window properties
+	ar.mainWindow.SetTitle("Windows Audio Recorder")
+	ar.mainWindow.SetSize(walk.Size{Width: 400, Height: 300})
+	ar.mainWindow.SetMinMaxSize(walk.Size{Width: 300, Height: 200}, walk.Size{Width: 600, Height: 400})
+	
+	// Create vertical layout
+	vbox, _ := walk.NewVBoxLayout(ar.mainWindow)
+	ar.mainWindow.SetLayout(vbox)
+
+	// Add record button
+	recordButton, _ := walk.NewPushButton(ar.mainWindow)
+	ar.recordButton = recordButton
+	ar.recordButton.SetText("Start Recording")
+	ar.recordButton.Clicked().Attach(func() {
+		ar.toggleRecording()
+	})
+
+	// Add status group box
+	statusGroupBox, _ := walk.NewGroupBox(ar.mainWindow)
+	statusGroupBox.SetTitle("Status")
+	vbox.AddWidget(statusGroupBox, false)
+	
+	statusLayout, _ := walk.NewVBoxLayout(statusGroupBox)
+	statusGroupBox.SetLayout(statusLayout)
+	
+	statusLabel, _ := walk.NewLabel(statusGroupBox)
+	ar.statusLabel = statusLabel
+	ar.statusLabel.SetText("Ready")
+	statusLayout.AddWidget(ar.statusLabel, false)
+
+	// Add time label
+	timeLabel, _ := walk.NewLabel(ar.mainWindow)
+	ar.timeLabel = timeLabel
+	ar.timeLabel.SetText("00:00:00")
+	vbox.AddWidget(ar.timeLabel, false)
+
+	// Add settings group box
+	settingsGroupBox, _ := walk.NewGroupBox(ar.mainWindow)
+	settingsGroupBox.SetTitle("Settings")
+	vbox.AddWidget(settingsGroupBox, false)
+	
+	settingsLayout, _ := walk.NewVBoxLayout(settingsGroupBox)
+	settingsGroupBox.SetLayout(settingsLayout)
+	
+	autoStartCheck, _ := walk.NewCheckBox(settingsGroupBox)
+	ar.autoStartCheck = autoStartCheck
+	ar.autoStartCheck.SetText("Start with Windows")
+	ar.autoStartCheck.Clicked().Attach(func() {
+		ar.toggleAutoStart()
+	})
+	settingsLayout.AddWidget(ar.autoStartCheck, false)
 
 	// Check if app is in startup and update checkbox
 	ar.updateAutoStartCheckbox()
 
-	// Show the window and run the message loop
-	ar.mainWindow.Show()
-	ar.mainWindow.Run()
+	// Handle minimize to tray
+	ar.mainWindow.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
+		if reason == walk.CloseReasonUser {
+			*canceled = true
+			ar.mainWindow.Hide()
+		}
+	})
 }
 
-// showMainWindow makes the main window visible and restores it if minimized
+// showMainWindow makes the main window visible
 func (ar *AudioRecorder) showMainWindow() {
 	if ar.mainWindow != nil {
-		ar.mainWindow.SetVisible(true)
-		ar.mainWindow.SetWindowState(walk.WindowNormal)
-		ar.mainWindow.SetForeground()
+		ar.mainWindow.Synchronize(func() {
+			ar.mainWindow.Show()
+		})
 	}
 }
 
@@ -292,46 +306,9 @@ func (ar *AudioRecorder) updateTimeDisplay() {
 
 // recordAudio captures audio from both microphone and speakers
 func (ar *AudioRecorder) recordAudio() {
-	// Configure audio device for microphone capture
-	var inputDevice malgo.DeviceConfig
-	var outputDevice malgo.DeviceConfig
-
-	// Get default devices if available
-	if len(ar.recordingDevices) > 0 {
-		inputDevice = malgo.DefaultDeviceConfig(malgo.Capture)
-		inputDevice.DeviceID = &ar.recordingDevices[0].ID
-	} else {
-		inputDevice = malgo.DefaultDeviceConfig(malgo.Capture)
-	}
-
-	if len(ar.playbackDevices) > 0 {
-		outputDevice = malgo.DefaultDeviceConfig(malgo.Loopback)
-		outputDevice.DeviceID = &ar.playbackDevices[0].ID
-	} else {
-		outputDevice = malgo.DefaultDeviceConfig(malgo.Loopback)
-	}
-
-	// Common configurations
+	// Configure audio capture settings
 	sampleRate := 44100
 	channels := 2
-
-	// Configure input device (microphone)
-	inputConfig := malgo.DeviceConfig{
-		DeviceType: malgo.Capture,
-		SampleRate: uint32(sampleRate),
-		Channels:   uint32(channels),
-		Format:     malgo.FormatF32,
-		DeviceID:   inputDevice.DeviceID,
-	}
-
-	// Configure output device (speaker loopback)
-	outputConfig := malgo.DeviceConfig{
-		DeviceType: malgo.Loopback,
-		SampleRate: uint32(sampleRate),
-		Channels:   uint32(channels),
-		Format:     malgo.FormatF32,
-		DeviceID:   outputDevice.DeviceID,
-	}
 
 	// Buffer for microphone data
 	micBuffer := make([][]float32, 0)
@@ -339,91 +316,125 @@ func (ar *AudioRecorder) recordAudio() {
 	// Buffer for speaker data
 	speakerBuffer := make([][]float32, 0)
 
-	// Callback for microphone
-	micCallback := malgo.DeviceCallbacks{
+	// Callback for microphone data
+	onRecvFramesMic := func(pSample []byte, frameCount uint32) {
+		if !ar.isRecording {
+			return
+		}
+
+		// Convert bytes to float32 samples
+		floatData := make([]float32, frameCount*uint32(channels))
+		for i := 0; i < len(pSample); i += 4 {
+			if i+3 < len(pSample) {
+				// Convert 4 bytes to float32
+				var val float32
+				binary.Read(bytes.NewReader(pSample[i:i+4]), binary.LittleEndian, &val)
+				floatData[i/4] = val
+			}
+		}
+
+		// Add to buffer
+		micBuffer = append(micBuffer, floatData)
+	}
+
+	// Callback for speaker data
+	onRecvFramesSpeaker := func(pSample []byte, frameCount uint32) {
+		if !ar.isRecording {
+			return
+		}
+
+		// Convert bytes to float32 samples
+		floatData := make([]float32, frameCount*uint32(channels))
+		for i := 0; i < len(pSample); i += 4 {
+			if i+3 < len(pSample) {
+				// Convert 4 bytes to float32
+				var val float32
+				binary.Read(bytes.NewReader(pSample[i:i+4]), binary.LittleEndian, &val)
+				floatData[i/4] = val
+			}
+		}
+
+		// Add to buffer
+		speakerBuffer = append(speakerBuffer, floatData)
+	}
+
+	// Set up microphone recording
+	var micConfig malgo.DeviceConfig
+	micConfig.DeviceType = malgo.Capture
+	micConfig.SampleRate = uint32(sampleRate)
+	micConfig.ChannelCount = uint32(channels)
+	micConfig.Format = malgo.FormatF32
+	micConfig.Alsa.NoMMap = 1
+
+	// Set up speaker recording (loopback)
+	var speakerConfig malgo.DeviceConfig
+	speakerConfig.DeviceType = malgo.Loopback
+	speakerConfig.SampleRate = uint32(sampleRate)
+	speakerConfig.ChannelCount = uint32(channels)
+	speakerConfig.Format = malgo.FormatF32
+	speakerConfig.Alsa.NoMMap = 1
+
+	// Choose default devices
+	if len(ar.recordingDevices) > 0 {
+		micConfig.DeviceID = ar.recordingDevices[0].ID
+	}
+
+	if len(ar.playbackDevices) > 0 {
+		speakerConfig.DeviceID = ar.playbackDevices[0].ID
+	}
+
+	// Size for sample frames
+	var sizeInBytes uint32 = 4 * uint32(channels) // 4 bytes per sample (float32) * channel count
+
+	// Create and start microphone device
+	micDevice, err := malgo.InitDevice(ar.ctx, micConfig, malgo.DeviceCallbacks{
 		Data: func(output, input []byte, frameCount uint32) {
 			if !ar.isRecording {
 				return
 			}
 
-			// Convert bytes to float32 samples
-			floatData := make([]float32, frameCount*uint32(channels))
-			samplesRead := 0
-			for i := 0; i < len(input); i += 4 {
-				if i+3 < len(input) {
-					var sample float32
-					// Convert 4 bytes to float32
-					// This is a simplistic approach, might need adjustment based on endianness
-					bytes := input[i : i+4]
-					sample = float32(float32frombytes(bytes))
-					if samplesRead < len(floatData) {
-						floatData[samplesRead] = sample
-						samplesRead++
-					}
-				}
-			}
-
-			// Add to buffer
-			micBuffer = append(micBuffer, floatData)
+			// Copy the input data
+			onRecvFramesMic(input, frameCount)
 		},
-	}
+	})
 
-	// Callback for speaker
-	speakerCallback := malgo.DeviceCallbacks{
-		Data: func(output, input []byte, frameCount uint32) {
-			if !ar.isRecording {
-				return
-			}
-
-			// Convert bytes to float32 samples
-			floatData := make([]float32, frameCount*uint32(channels))
-			samplesRead := 0
-			for i := 0; i < len(input); i += 4 {
-				if i+3 < len(input) {
-					var sample float32
-					bytes := input[i : i+4]
-					sample = float32(float32frombytes(bytes))
-					if samplesRead < len(floatData) {
-						floatData[samplesRead] = sample
-						samplesRead++
-					}
-				}
-			}
-
-			// Add to buffer
-			speakerBuffer = append(speakerBuffer, floatData)
-		},
-	}
-
-	// Create devices
-	micDevice, err := malgo.InitDevice(ar.ctx.Context, inputConfig, micCallback)
 	if err != nil {
 		fmt.Println("Failed to initialize microphone device:", err)
 		ar.isRecording = false
 		return
 	}
 
-	speakerDevice, err := malgo.InitDevice(ar.ctx.Context, outputConfig, speakerCallback)
+	err = micDevice.Start()
 	if err != nil {
-		fmt.Println("Failed to initialize speaker loopback device:", err)
+		fmt.Println("Failed to start microphone device:", err)
 		micDevice.Uninit()
 		ar.isRecording = false
 		return
 	}
 
-	// Start devices
-	err = micDevice.Start()
+	// Create and start speaker device
+	speakerDevice, err := malgo.InitDevice(ar.ctx, speakerConfig, malgo.DeviceCallbacks{
+		Data: func(output, input []byte, frameCount uint32) {
+			if !ar.isRecording {
+				return
+			}
+
+			// Copy the input data
+			onRecvFramesSpeaker(input, frameCount)
+		},
+	})
+
 	if err != nil {
-		fmt.Println("Failed to start microphone device:", err)
+		fmt.Println("Failed to initialize speaker device:", err)
+		micDevice.Stop()
 		micDevice.Uninit()
-		speakerDevice.Uninit()
 		ar.isRecording = false
 		return
 	}
 
 	err = speakerDevice.Start()
 	if err != nil {
-		fmt.Println("Failed to start speaker loopback device:", err)
+		fmt.Println("Failed to start speaker device:", err)
 		micDevice.Stop()
 		micDevice.Uninit()
 		speakerDevice.Uninit()
@@ -472,7 +483,6 @@ func mixAudioBuffers(micBuffer, speakerBuffer [][]float32) [][]float32 {
 		mixedSamples := make([]float32, samplesLen)
 		for j := 0; j < samplesLen; j++ {
 			// Simple mixing - average the samples
-			// Could use more sophisticated mixing algorithm
 			mixedSamples[j] = (micSamples[j] + speakerSamples[j]) / 2.0
 		}
 
@@ -500,35 +510,30 @@ func (ar *AudioRecorder) saveRecording() {
 	}
 
 	// Create WAV file
-	waveFile, err := os.Create(outputFile)
+	file, err := os.Create(outputFile)
 	if err != nil {
 		fmt.Println("Failed to create output file:", err)
 		return
 	}
-	defer waveFile.Close()
+	defer file.Close()
 
-	// WAV parameters
+	// WAV header parameters
 	numChannels := 2
 	sampleRate := 44100
 	bitsPerSample := 16
-
-	// Create WAV writer
-	wavWriter, err := wav.NewWriter(waveFile, uint32(totalSamples), uint16(numChannels), uint32(sampleRate), uint16(bitsPerSample))
-	if err != nil {
-		fmt.Println("Failed to create WAV writer:", err)
-		return
-	}
-
-	// Convert float32 samples to int16 and write to file
+	
+	// Calculate data size
+	dataSize := totalSamples * numChannels * (bitsPerSample / 8)
+	
+	// Write WAV header
+	writeWavHeader(file, numChannels, sampleRate, bitsPerSample, dataSize)
+	
+	// Write audio data
 	for _, buffer := range ar.capturedSamples {
 		for _, sample := range buffer {
 			// Convert float32 (-1.0 to 1.0) to int16 range
 			int16Sample := int16(sample * 32767)
-			err := wavWriter.WriteInt16(int16Sample)
-			if err != nil {
-				fmt.Println("Error writing to WAV file:", err)
-				return
-			}
+			binary.Write(file, binary.LittleEndian, int16Sample)
 		}
 	}
 
@@ -536,6 +541,36 @@ func (ar *AudioRecorder) saveRecording() {
 	walk.MsgBox(ar.mainWindow, "Recording Saved", 
 		fmt.Sprintf("Recording saved to:\n%s", outputFile), 
 		walk.MsgBoxIconInformation)
+}
+
+// writeWavHeader writes a WAV file header to the given file
+func writeWavHeader(file *os.File, numChannels, sampleRate, bitsPerSample, dataSize int) {
+	// RIFF header
+	file.WriteString("RIFF")
+	// File size (minus 8 bytes for "RIFF" and size)
+	fileSize := 36 + dataSize
+	binary.Write(file, binary.LittleEndian, uint32(fileSize))
+	file.WriteString("WAVE")
+	
+	// Format chunk
+	file.WriteString("fmt ")
+	binary.Write(file, binary.LittleEndian, uint32(16)) // Format chunk size
+	binary.Write(file, binary.LittleEndian, uint16(1)) // PCM format
+	binary.Write(file, binary.LittleEndian, uint16(numChannels))
+	binary.Write(file, binary.LittleEndian, uint32(sampleRate))
+	
+	// Bytes per second & block align
+	bytesPerSample := bitsPerSample / 8
+	blockAlign := numChannels * bytesPerSample
+	bytesPerSec := sampleRate * blockAlign
+	
+	binary.Write(file, binary.LittleEndian, uint32(bytesPerSec))
+	binary.Write(file, binary.LittleEndian, uint16(blockAlign))
+	binary.Write(file, binary.LittleEndian, uint16(bitsPerSample))
+	
+	// Data chunk
+	file.WriteString("data")
+	binary.Write(file, binary.LittleEndian, uint32(dataSize))
 }
 
 // toggleAutoStart sets or removes the app from Windows startup
@@ -561,7 +596,7 @@ func (ar *AudioRecorder) addToStartup() {
 		fmt.Println("Failed to open startup registry key:", err)
 		return
 	}
-	defer key.Close()
+	defer key.Release()
 
 	execPath, err := os.Executable()
 	if err != nil {
@@ -580,7 +615,7 @@ func (ar *AudioRecorder) removeFromStartup() {
 		fmt.Println("Failed to open startup registry key:", err)
 		return
 	}
-	defer key.Close()
+	defer key.Release()
 
 	// Delete registry value
 	oleutil.MustCallMethod(key, "DeleteValue", "AudioRecorder")
@@ -592,7 +627,7 @@ func (ar *AudioRecorder) checkIfInStartup() bool {
 	if err != nil {
 		return false
 	}
-	defer key.Close()
+	defer key.Release()
 
 	// Try to get the value
 	_, err = oleutil.GetProperty(key, "AudioRecorder")
@@ -625,12 +660,6 @@ func openStartupKey() (*ole.IDispatch, error) {
 	return wshell, nil
 }
 
-// float32frombytes converts 4 bytes to a float32
-func float32frombytes(bytes []byte) float32 {
-	bits := uint32(bytes[0]) | uint32(bytes[1])<<8 | uint32(bytes[2])<<16 | uint32(bytes[3])<<24
-	return float32(bits)
-}
-
 // getIconData returns a simple icon for the system tray
 func getIconData() []byte {
 	// This is a 16x16 pixel icon in ICO format (simplified version)
@@ -639,35 +668,6 @@ func getIconData() []byte {
 		0, 0, 1, 0, 1, 0, 16, 16, 0, 0, 1, 0, 24, 0, 104, 4,
 		0, 0, 22, 0, 0, 0, 40, 0, 0, 0, 16, 0, 0, 0, 32, 0,
 		0, 0, 1, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
