@@ -34,7 +34,7 @@ deps:
 .PHONY: compile
 compile: deps ensure_out_dir
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) CC=$(CC) CXX=$(CXX) \
-	$(GO) build -ldflags="-H windowsgui" -o $(OUT_DIR)/$(APP_NAME).exe
+	$(GO) build -ldflags="-H windowsgui:false" -o $(OUT_DIR)/$(APP_NAME).exe
 	@echo "Build complete: $(OUT_DIR)/$(APP_NAME).exe"
 
 # Alias for backward compatibility
@@ -45,7 +45,7 @@ build: compile
 .PHONY: compile_with_icon
 compile_with_icon: deps ensure_out_dir icon.syso
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) CC=$(CC) CXX=$(CXX) \
-	$(GO) build -ldflags="-H windowsgui" -o $(OUT_DIR)/$(APP_NAME).exe
+	$(GO) build -ldflags="-H windowsgui:false" -o $(OUT_DIR)/$(APP_NAME).exe
 	@echo "Build with icon complete: $(OUT_DIR)/$(APP_NAME).exe"
 
 # Compile icon resource file
