@@ -293,3 +293,18 @@ func (r *Recorder) GetRecordingDuration() time.Duration {
 func (r *Recorder) IsRecording() bool {
 	return r.recordingActive
 }
+
+// GetMicBuffer returns the microphone buffer for external processing
+func (r *Recorder) GetMicBuffer() *Buffer {
+	return r.micBuffer
+}
+
+// GetMicBuffer returns the speaker buffer for external processing
+func (r *Recorder) GetSpeakerBuffer() *Buffer {
+	return r.speakerBuffer
+}
+
+// GetMicBuffer returns the speaker buffer for external processing
+func (r *Recorder) GetMixedBuffer() *Buffer {
+	return r.mixedBuffer
+}

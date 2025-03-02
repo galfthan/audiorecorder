@@ -64,6 +64,23 @@ func (b *Buffer) Get() ([]float32, time.Time, int, int) {
 	return samplesCopy, timestamp, sampleRate, channels
 }
 
+// Get samples without clearing the buffer
+func (b *Buffer) Peek(maxDuration float64, sampleRate int) []float32 {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	maxSamples := int(maxDuration * float64(sampleRate) * float64(b.channels))
+	if maxSamples > len(b.samples) {
+		maxSamples = len(b.samples)
+	}
+
+	// Make a copy of the requested samples
+	samplesCopy := make([]float32, maxSamples)
+	copy(samplesCopy, b.samples[:maxSamples])
+
+	return samplesCopy
+}
+
 // IsEmpty checks if the buffer is empty
 func (b *Buffer) IsEmpty() bool {
 	b.mutex.Lock()
