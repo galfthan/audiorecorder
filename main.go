@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/galfthan/audiorecorder/audio" // Audio package
+	"github.com/galfthan/audiorecorder/transcription"
+
+	//transcription
 	"github.com/gen2brain/malgo"
 )
 
@@ -101,11 +104,93 @@ func main() {
 			}
 		}
 	}
+	fmt.Print("\nEnable live transcription? (y/n, default: y): ")
+	enableTranscription := true
+	var transcriptionInput string
+	fmt.Scanln(&transcriptionInput)
+	if strings.ToLower(transcriptionInput) == "y" {
+		enableTranscription = true
+	}
+
+	// Whisper model selection if transcription is enabled
+	var modelPath string
+	if enableTranscription {
+		// Default model directory in the same folder as the executable
+		exePath, err := os.Executable()
+		if err != nil {
+			exePath = "."
+		}
+		modelDir := filepath.Join(filepath.Dir(exePath), "models")
+
+		// Check for models directory
+		if _, err := os.Stat(modelDir); os.IsNotExist(err) {
+			os.MkdirAll(modelDir, 0755)
+			fmt.Println("\nCreated models directory:", modelDir)
+			fmt.Println("Please download a Whisper model (ggml format) and place it in this directory.")
+			fmt.Println("Models can be found at: https://huggingface.co/ggerganov/whisper.cpp")
+			fmt.Println("Recommended model for confidential meetings: ggml-base.en.bin")
+		}
+
+		// List available models
+		models, err := filepath.Glob(filepath.Join(modelDir, "*.bin"))
+		if err != nil || len(models) == 0 {
+			fmt.Println("\nNo Whisper models found in:", modelDir)
+			fmt.Println("Please download a model from: https://huggingface.co/ggerganov/whisper.cpp")
+			fmt.Println("Recommended: ggml-base.en.bin or ggml-small.en.bin")
+			enableTranscription = false
+		} else {
+			fmt.Println("\nAvailable Whisper models:")
+			for i, model := range models {
+				fmt.Printf("%d: %s\n", i, filepath.Base(model))
+			}
+
+			// Ask user to select model
+			fmt.Print("\nSelect model by number (default: 0): ")
+			modelIndex := 0
+			var modelInput string
+			fmt.Scanln(&modelInput)
+			if modelInput != "" {
+				fmt.Sscanf(modelInput, "%d", &modelIndex)
+				if modelIndex < 0 || modelIndex >= len(models) {
+					fmt.Println("Invalid selection, using first model.")
+					modelIndex = 0
+				}
+			}
+			modelPath = models[modelIndex]
+			fmt.Println("Using model:", filepath.Base(modelPath))
+		}
+	}
 
 	fmt.Println("\nContinuous recording settings:")
 	fmt.Printf("- Saving every %d seconds\n", chunkDuration)
-	fmt.Println("- Recordings will be saved to:", outputFolder)
+	fmt.Println("- Recording will be saved to:", outputFolder)
+	if enableTranscription {
+		fmt.Println("- Transcription will be saved to:", outputFolder)
+	}
 	fmt.Println("Press Ctrl+C to stop recording and save...")
+
+	// Initialize transcription if enabled
+	var transcriber *transcription.Transcriber
+	if enableTranscription && modelPath != "" {
+		// Create transcription config
+		transcriptionConfig := transcription.TranscriptionConfig{
+			ModelPath:      modelPath,
+			Language:       "en", // Default to English
+			BatchSeconds:   10.0, // Process 10 seconds at a time
+			OutputFolder:   outputFolder,
+			TranscriptName: recordingName,
+			SaveTimestamps: true,
+		}
+
+		// Initialize transcriber
+		var err error
+		transcriber, err = transcription.NewTranscriber(transcriptionConfig)
+		if err != nil {
+			fmt.Println("Failed to initialize transcription:", err)
+			fmt.Println("Continuing without transcription.")
+			enableTranscription = false
+		}
+	}
 
 	// Audio settings
 	sampleRate := 16000
@@ -250,9 +335,26 @@ func main() {
 	// Start the continuous recording process
 	recorder.StartRecording()
 
+	// Start transcription if enabled
+	if enableTranscription && transcriber != nil {
+		err := transcriber.Start(recorder.GetMicBuffer(), recorder.GetSpeakerBuffer())
+		if err != nil {
+			fmt.Println("Failed to start transcription:", err)
+			transcriber.Close()
+			enableTranscription = false
+		} else {
+			fmt.Println("Live transcription enabled!")
+			fmt.Println("Transcript will be saved to:", transcriber.GetTranscriptFilePath())
+			defer transcriber.Close() // Ensure transcriber is closed when program exits
+		}
+	}
+
 	// Print recording status with microphone level indicator
 	stopDisplaying := make(chan bool)
-
+	transcriptionStatus := "No"
+	if enableTranscription && transcriber != nil {
+		transcriptionStatus = "Yes"
+	}
 	go func() {
 		for {
 			select {
@@ -287,13 +389,14 @@ func main() {
 				meter += "]"
 
 				// Show recording stats
-				fmt.Printf("\rRecording... %02d:%02d:%02d  Mic: %s %d%%  Next save: %02d:%02d  File: %s",
+				fmt.Printf("\rRecording... %02d:%02d:%02d  Mic: %s %d%%  Next save: %02d:%02d  Transcribing: %s  File: %s",
 					int(elapsed.Hours()),
 					int(elapsed.Minutes())%60,
 					int(elapsed.Seconds())%60,
 					meter, level,
 					int(nextSaveIn.Minutes())%60,
 					int(nextSaveIn.Seconds())%60,
+					transcriptionStatus, // Add this parameter
 					filepath.Base(recorder.GetOutputFilePath()))
 
 				time.Sleep(100 * time.Millisecond)

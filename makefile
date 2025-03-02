@@ -15,6 +15,9 @@ CGO_ENABLED := 1
 CC := x86_64-w64-mingw32-gcc
 CXX := x86_64-w64-mingw32-g++
 
+CGO_CFLAGS := "-I/home/alfthan/whisper.cpp/include  -I/home/alfthan/whisper.cpp/ggml/include"
+CGO_LDFLAGS := "-L/home/alfthan/whisper.cpp/build/src -lwhisper -L/home/alfthan/whisper.cpp/build/ggml/src -lggml"
+
 # Default target
 .PHONY: all
 all: deps ensure_out_dir compile
@@ -34,6 +37,7 @@ deps:
 .PHONY: compile
 compile: deps ensure_out_dir
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) CC=$(CC) CXX=$(CXX) \
+	CGO_CFLAGS=$(CGO_CFLAGS) CGO_LDFLAGS=$(CGO_LDFLAGS) \
 	$(GO) build  -o $(OUT_DIR)/$(APP_NAME).exe
 	@echo "Build complete: $(OUT_DIR)/$(APP_NAME).exe"
 
