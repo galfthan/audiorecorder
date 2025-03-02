@@ -23,8 +23,30 @@ type AudioChunk struct {
 	Channels   int
 }
 
-func main() {
+// Configuration for continuous recording
+type RecordingConfig struct {
+	ChunkDurationSeconds int    // Duration of each WAV file in seconds
+	OutputFolder         string // Where to save the recordings
+	RecordingName        string // Base name for recordings
+	SampleRate           int    // Audio sample rate
+	Channels             int    // Number of audio channels
+}
 
+// Manages the continuous recording process
+type ContinuousRecorder struct {
+	config                RecordingConfig
+	micChunks             []AudioChunk
+	speakerChunks         []AudioChunk
+	audioMutex            sync.Mutex
+	currentFileNum        int
+	recordingActive       bool
+	startTime             time.Time
+	currentChunkStartTime time.Time
+	// Place for future whisper integration
+	transcriptionCh chan []float32 // Channel to send audio for transcription
+}
+
+func main() {
 	// Get custom filename from command line arguments
 	recordingName := "recording" // Default name
 	if len(os.Args) > 1 {
@@ -39,11 +61,6 @@ func main() {
 	outputFolder := filepath.Join(homeDir, "AudioRecordings")
 	os.MkdirAll(outputFolder, 0755)
 
-	// Use custom name with date for filename that will output at end
-	dateStr := time.Now().Format("2006_01_02")
-	filename := fmt.Sprintf("%s_%s.wav", recordingName, dateStr)
-	mixedFile := filepath.Join(outputFolder, filename)
-
 	// Initialize audio context
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
 		fmt.Println("AUDIO:", message)
@@ -56,7 +73,7 @@ func main() {
 	}
 	defer ctx.Free()
 
-	fmt.Println("Windows Audio Recorder (Clean Audio + Sync)")
+	fmt.Println("Windows Audio Recorder (Continuous Recording)")
 	fmt.Println("----------------------------------------")
 
 	// List available audio devices
@@ -83,14 +100,28 @@ func main() {
 			fmt.Printf("%d: %s\n", i, device.Name())
 		}
 	}
+
 	// Show current recording name
 	fmt.Printf("\nRecording name: %s\n", recordingName)
+
+	// Ask user for continuous recording settings
+	fmt.Print("\nEnter duration for each WAV file (in seconds, default 300): ")
+	chunkDuration := 300 // Default 5 minutes
+	var input string
+	fmt.Scanln(&input)
+	if input != "" {
+		fmt.Sscanf(input, "%d", &chunkDuration)
+		if chunkDuration < 10 {
+			fmt.Println("Duration too short, using minimum of 10 seconds.")
+			chunkDuration = 10
+		}
+	}
 
 	// Ask user to select microphone device
 	var micDeviceIndex int
 	if len(captureDevices) > 1 {
 		fmt.Print("\nSelect microphone by number (or press Enter for default): ")
-		input := ""
+		input = ""
 		fmt.Scanln(&input)
 		if input != "" {
 			fmt.Sscanf(input, "%d", &micDeviceIndex)
@@ -101,20 +132,26 @@ func main() {
 		}
 	}
 
-	fmt.Println("\nRecording will be saved to:", outputFolder)
+	fmt.Println("\nContinuous recording settings:")
+	fmt.Printf("- Each WAV file will be %d seconds long\n", chunkDuration)
+	fmt.Println("- Recordings will be saved to:", outputFolder)
 	fmt.Println("Press Ctrl+C to stop recording and save...")
 
-	// Audio settings - use original parameters
+	// Audio settings
 	sampleRate := 44100
 	channels := 2
 
-	// Create channels to store audio data
-	var micChunks []AudioChunk
-	var speakerChunks []AudioChunk
-	var audioMutex sync.Mutex
+	// Create recorder configuration
+	config := RecordingConfig{
+		ChunkDurationSeconds: chunkDuration,
+		OutputFolder:         outputFolder,
+		RecordingName:        recordingName,
+		SampleRate:           sampleRate,
+		Channels:             channels,
+	}
 
-	// Record the exact recording start time
-	recordingStartTime := time.Now()
+	// Create continuous recorder
+	recorder := NewContinuousRecorder(config)
 
 	// Set up microphone recording with specific device
 	micConfig := malgo.DeviceConfig{
@@ -175,15 +212,13 @@ func main() {
 			micLevel = level
 			micMutex.Unlock()
 
-			// Store the chunk with its timestamp
-			audioMutex.Lock()
-			micChunks = append(micChunks, AudioChunk{
+			// Add audio chunk to recorder
+			recorder.AddMicChunk(AudioChunk{
 				Samples:    samplesF32,
 				Timestamp:  chunkTime,
 				SampleRate: sampleRate,
 				Channels:   int(channels),
 			})
-			audioMutex.Unlock()
 		},
 	})
 	if err != nil {
@@ -229,15 +264,13 @@ func main() {
 				}
 			}
 
-			// Store the chunk with its timestamp
-			audioMutex.Lock()
-			speakerChunks = append(speakerChunks, AudioChunk{
+			// Add audio chunk to recorder
+			recorder.AddSpeakerChunk(AudioChunk{
 				Samples:    samplesF32,
 				Timestamp:  chunkTime,
 				SampleRate: sampleRate,
 				Channels:   int(channels),
 			})
-			audioMutex.Unlock()
 		},
 	})
 	if err != nil {
@@ -254,8 +287,10 @@ func main() {
 		}
 	}
 
+	// Start the continuous recording process
+	recorder.StartRecording()
+
 	// Print recording status with microphone level indicator
-	startTime := time.Now()
 	stopRecording := make(chan bool)
 
 	go func() {
@@ -264,7 +299,9 @@ func main() {
 			case <-stopRecording:
 				return
 			default:
-				elapsed := time.Since(startTime)
+				elapsed := time.Since(recorder.startTime)
+				nextSaveIn := time.Duration(config.ChunkDurationSeconds)*time.Second -
+					time.Since(recorder.GetCurrentChunkStartTime())
 
 				// Get current mic level safely
 				micMutex.Lock()
@@ -290,17 +327,14 @@ func main() {
 				meter += "]"
 
 				// Show recording stats
-				audioMutex.Lock()
-				micCount := len(micChunks)
-				speakerCount := len(speakerChunks)
-				audioMutex.Unlock()
-
-				fmt.Printf("\rRecording... %02d:%02d:%02d  Mic: %s %d%%  Chunks: Mic=%d Spk=%d",
+				fmt.Printf("\rRecording... %02d:%02d:%02d  Mic: %s %d%%  Next save: %02d:%02d  Files: %d",
 					int(elapsed.Hours()),
 					int(elapsed.Minutes())%60,
 					int(elapsed.Seconds())%60,
 					meter, level,
-					micCount, speakerCount)
+					int(nextSaveIn.Minutes())%60,
+					int(nextSaveIn.Seconds())%60,
+					recorder.currentFileNum)
 
 				time.Sleep(100 * time.Millisecond)
 			}
@@ -320,21 +354,124 @@ func main() {
 		speakerDevice.Stop()
 	}
 
-	// Copy chunks safely
-	audioMutex.Lock()
-	micChunksCopy := make([]AudioChunk, len(micChunks))
-	copy(micChunksCopy, micChunks)
+	// Finalize the recording (save any remaining chunks)
+	recorder.StopRecording()
 
-	speakerChunksCopy := make([]AudioChunk, len(speakerChunks))
-	copy(speakerChunksCopy, speakerChunks)
-	audioMutex.Unlock()
-
-	// Create synchronized mixed recording
-	fmt.Println("Creating synchronized mixed recording...")
-	createSynchronizedMix(mixedFile, micChunksCopy, speakerChunksCopy, recordingStartTime, sampleRate, channels)
-	fmt.Println("Recording saved successfully to:", mixedFile)
+	fmt.Println("All recordings saved successfully to:", outputFolder)
 	fmt.Println("Press Enter to exit...")
 	fmt.Scanln()
+}
+
+// NewContinuousRecorder creates a new continuous recorder with the given configuration
+func NewContinuousRecorder(config RecordingConfig) *ContinuousRecorder {
+	return &ContinuousRecorder{
+		config:          config,
+		micChunks:       []AudioChunk{},
+		speakerChunks:   []AudioChunk{},
+		audioMutex:      sync.Mutex{},
+		currentFileNum:  0,
+		recordingActive: false,
+		transcriptionCh: make(chan []float32, 10), // Buffer for transcription
+	}
+}
+
+// StartRecording begins the continuous recording process
+func (r *ContinuousRecorder) StartRecording() {
+	r.recordingActive = true
+	r.startTime = time.Now()
+	r.currentChunkStartTime = time.Now()
+
+	// Start a goroutine to handle saving chunks at regular intervals
+	go r.saveChunksRoutine()
+
+	// This is where we would start the transcription process in the future
+	// go r.transcriptionRoutine()
+}
+
+// StopRecording stops the recording and saves any remaining chunks
+func (r *ContinuousRecorder) StopRecording() {
+	r.recordingActive = false
+	r.saveCurrentChunks()
+
+	// Close transcription channel to signal shutdown
+	close(r.transcriptionCh)
+}
+
+// AddMicChunk adds a microphone chunk to the recorder
+func (r *ContinuousRecorder) AddMicChunk(chunk AudioChunk) {
+	r.audioMutex.Lock()
+	r.micChunks = append(r.micChunks, chunk)
+	r.audioMutex.Unlock()
+
+	// Here's where we could send samples to the transcription channel
+	// if we wanted to do live transcription
+	// r.transcriptionCh <- chunk.Samples
+}
+
+// AddSpeakerChunk adds a speaker chunk to the recorder
+func (r *ContinuousRecorder) AddSpeakerChunk(chunk AudioChunk) {
+	r.audioMutex.Lock()
+	r.speakerChunks = append(r.speakerChunks, chunk)
+	r.audioMutex.Unlock()
+}
+
+// GetCurrentChunkStartTime returns when the current chunk started
+
+// GetCurrentChunkStartTime returns when the current chunk started
+func (r *ContinuousRecorder) GetCurrentChunkStartTime() time.Time {
+	return r.currentChunkStartTime
+}
+
+// saveChunksRoutine continuously saves chunks at regular intervals
+func (r *ContinuousRecorder) saveChunksRoutine() {
+	for r.recordingActive {
+		// Sleep until it's time to save
+		time.Sleep(time.Duration(r.config.ChunkDurationSeconds) * time.Second)
+		if !r.recordingActive {
+			break
+		}
+
+		// Save current chunks to a file
+		r.saveCurrentChunks()
+
+		// Reset chunk start time
+		r.currentChunkStartTime = time.Now()
+	}
+}
+
+// saveCurrentChunks saves the current audio chunks to a WAV file and clears the buffers
+func (r *ContinuousRecorder) saveCurrentChunks() {
+	r.audioMutex.Lock()
+	// Make copies of current chunks
+	micChunksCopy := make([]AudioChunk, len(r.micChunks))
+	copy(micChunksCopy, r.micChunks)
+
+	speakerChunksCopy := make([]AudioChunk, len(r.speakerChunks))
+	copy(speakerChunksCopy, r.speakerChunks)
+
+	// Clear current chunks
+	r.micChunks = []AudioChunk{}
+	r.speakerChunks = []AudioChunk{}
+	r.audioMutex.Unlock()
+
+	// Skip if we don't have any audio
+	if len(micChunksCopy) == 0 && len(speakerChunksCopy) == 0 {
+		return
+	}
+
+	// Increment file number
+	r.currentFileNum++
+
+	// Generate filename with timestamp and number
+	timestamp := time.Now().Format("2006_01_02_15_04_05")
+	filename := fmt.Sprintf("%s_%s_part%03d.wav",
+		r.config.RecordingName, timestamp, r.currentFileNum)
+	filePath := filepath.Join(r.config.OutputFolder, filename)
+
+	// Create synchronized mixed recording
+	fmt.Println("\nSaving file:", filename)
+	createSynchronizedMix(filePath, micChunksCopy, speakerChunksCopy,
+		r.startTime, r.config.SampleRate, r.config.Channels)
 }
 
 // flattenChunks combines multiple audio chunks into a single sample array
@@ -402,12 +539,10 @@ func createSynchronizedMix(filePath string, micChunks, speakerChunks []AudioChun
 		// Mic started first
 		offsetMs := firstSpeakerTime.Sub(firstMicTime).Milliseconds()
 		offsetSamples = int(float64(offsetMs) * samplesPerMs)
-		fmt.Printf("Speaker started %.1f ms after microphone\n", float64(offsetMs))
 	} else {
 		// Speaker started first
 		offsetMs := firstMicTime.Sub(firstSpeakerTime).Milliseconds()
 		offsetSamples = -int(float64(offsetMs) * samplesPerMs)
-		fmt.Printf("Microphone started %.1f ms after speaker\n", float64(offsetMs))
 	}
 
 	// Flatten both streams
@@ -513,3 +648,16 @@ func saveWAV(filePath string, samples []float32, sampleRate, channels int) error
 
 	return nil
 }
+
+// Future whisper integration function
+/*
+func (r *ContinuousRecorder) transcriptionRoutine() {
+    // This is where the whisper integration would happen
+    // It would receive audio from the transcriptionCh channel
+    // and pass it to whisper for processing
+    for samples := range r.transcriptionCh {
+        // Future: Process samples with whisper
+        // ...
+    }
+}
+*/
