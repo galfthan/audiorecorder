@@ -76,6 +76,13 @@ func NewTranscriber(config TranscriptionConfig) (*Transcriber, error) {
 		return nil, fmt.Errorf("failed to create Whisper context: %v", err)
 	}
 
+	// Configure context if language is specified
+	if config.Language != "" {
+		if err := context.SetLanguage(config.Language); err != nil {
+			fmt.Printf("Warning: Could not set language to %s: %v\n", config.Language, err)
+		}
+	}
+
 	// Generate transcript filename
 	timestamp := time.Now().Format("2006_01_02_15_04_05")
 	filename := fmt.Sprintf("%s_transcript_%s.txt", config.TranscriptName, timestamp)
@@ -84,8 +91,7 @@ func NewTranscriber(config TranscriptionConfig) (*Transcriber, error) {
 	// Create/open transcript file
 	file, err := os.Create(filePath)
 	if err != nil {
-		context.Free()
-		model.Close()
+		context.SetLanguage("auto")
 		return nil, fmt.Errorf("failed to create transcript file: %v", err)
 	}
 
@@ -97,7 +103,6 @@ func NewTranscriber(config TranscriptionConfig) (*Transcriber, error) {
 
 	if _, err := file.WriteString(headerText); err != nil {
 		file.Close()
-		context.Free()
 		model.Close()
 		return nil, fmt.Errorf("failed to write to transcript file: %v", err)
 	}
@@ -126,8 +131,10 @@ func (t *Transcriber) Close() {
 		t.transcriptFile.Close()
 	}
 
-	t.context.Free()
-	t.model.Close()
+	// Close the model and context
+	if t.model != nil {
+		t.model.Close()
+	}
 }
 
 // Start begins the transcription process
@@ -137,11 +144,6 @@ func (t *Transcriber) Start(micBuffer, speakerBuffer *audio.Buffer) error {
 
 	if t.isRunning {
 		return fmt.Errorf("transcription already running")
-	}
-
-	// Set whisper parameters
-	if t.config.Language != "" {
-		t.context.SetLanguage(t.config.Language)
 	}
 
 	// Start the writer goroutine for synchronized output
@@ -227,7 +229,8 @@ func (t *Transcriber) processAudioLoop(buffer *audio.Buffer, source AudioSource)
 			}
 
 			// Get audio batch for transcription (without clearing buffer)
-			audioData, timestamp := buffer.Peek(t.config.BatchSeconds)
+			maxDuration := t.config.BatchSeconds
+			audioData := buffer.Peek(maxDuration, int(maxDuration))
 
 			// Skip if not enough audio data
 			if len(audioData) < 1000 { // Arbitrary small number to avoid processing tiny chunks
@@ -236,7 +239,7 @@ func (t *Transcriber) processAudioLoop(buffer *audio.Buffer, source AudioSource)
 			}
 
 			// Process with Whisper
-			segments, err := t.processAudioBatch(audioData, source, timestamp)
+			segments, err := t.processAudioBatch(audioData, source)
 			if err != nil {
 				fmt.Printf("Transcription error (%s): %v\n", sourceLabel, err)
 			} else if len(segments) > 0 {
@@ -267,25 +270,34 @@ func (t *Transcriber) processAudioLoop(buffer *audio.Buffer, source AudioSource)
 }
 
 // processAudioBatch sends audio data to Whisper and returns transcript segments
-func (t *Transcriber) processAudioBatch(audioData []float32, source AudioSource, timestamp time.Time) ([]TranscriptSegment, error) {
+func (t *Transcriber) processAudioBatch(audioData []float32, source AudioSource) ([]TranscriptSegment, error) {
+	// Reset timings before processing
+	t.context.ResetTimings()
+
 	// Process with Whisper
-	if err := t.context.Process(audioData, nil); err != nil {
+	err := t.context.Process(audioData, nil, nil)
+	if err != nil {
 		return nil, fmt.Errorf("whisper processing failed: %v", err)
 	}
 
 	// Extract segments
-	n := t.context.SegmentCount()
-	segments := make([]TranscriptSegment, 0, n)
+	segments := make([]TranscriptSegment, 0)
 
-	for i := 0; i < n; i++ {
-		segment := t.context.Segment(i)
+	// Iterate through segments using NextSegment()
+	for {
+		segment, err := t.context.NextSegment()
+		if err != nil {
+			// Break on EOF or any other error
+			break
+		}
+
 		if len(strings.TrimSpace(segment.Text)) > 0 {
 			segments = append(segments, TranscriptSegment{
 				Text:      segment.Text,
-				StartTime: float64(segment.Start) / 100.0, // Convert to seconds
-				EndTime:   float64(segment.End) / 100.0,   // Convert to seconds
+				StartTime: float64(segment.Start) / float64(time.Second), // Convert to seconds
+				EndTime:   float64(segment.End) / float64(time.Second),   // Convert to seconds
 				Source:    source,
-				Timestamp: timestamp,
+				Timestamp: time.Now(), // Use current time as timestamp
 			})
 		}
 	}

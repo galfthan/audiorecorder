@@ -12,11 +12,15 @@ WINDRES := x86_64-w64-mingw32-windres
 GOOS := windows
 GOARCH := amd64
 CGO_ENABLED := 1
-CC := x86_64-w64-mingw32-gcc
-CXX := x86_64-w64-mingw32-g++
+CC := x86_64-w64-mingw32-gcc-posix
+CXX := x86_64-w64-mingw32-g++-posix
 
-CGO_CFLAGS := "-I/home/alfthan/whisper.cpp/include  -I/home/alfthan/whisper.cpp/ggml/include"
-CGO_LDFLAGS := "-L/home/alfthan/whisper.cpp/build/src -lwhisper -L/home/alfthan/whisper.cpp/build/ggml/src -lggml"
+# Whisper.cpp library paths
+WHISPER_DIR := /home/alfthan/whisper.cpp
+
+# Compilation flags
+CGO_CFLAGS := "-I$(WHISPER_DIR)/include -I$(WHISPER_DIR)/ggml/include"
+CGO_LDFLAGS := "-L$(WHISPER_DIR)/build-windows/ggml/src -l:ggml.a -l:ggml-base.a  -l:ggml-cpu.a -L$(WHISPER_DIR)/build-windows/src -l:libwhisper.a -lstdc++ -static-libstdc++ -static-libgcc -lm -fopenmp"
 
 # Default target
 .PHONY: all
@@ -36,9 +40,11 @@ deps:
 # Build the main executable
 .PHONY: compile
 compile: deps ensure_out_dir
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) CC=$(CC) CXX=$(CXX) \
-	CGO_CFLAGS=$(CGO_CFLAGS) CGO_LDFLAGS=$(CGO_LDFLAGS) \
-	$(GO) build  -o $(OUT_DIR)/$(APP_NAME).exe
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) \
+	CC=$(CC) CXX=$(CXX) \
+	CGO_CFLAGS=$(CGO_CFLAGS) \
+	CGO_LDFLAGS=$(CGO_LDFLAGS) \
+	$(GO) build -ldflags="-s -w" -o $(OUT_DIR)/$(APP_NAME).exe
 	@echo "Build complete: $(OUT_DIR)/$(APP_NAME).exe"
 
 # Alias for backward compatibility
@@ -48,8 +54,11 @@ build: compile
 # Build with icon resource (if available)
 .PHONY: compile_with_icon
 compile_with_icon: deps ensure_out_dir icon.syso
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) CC=$(CC) CXX=$(CXX) \
-	$(GO) build  -o $(OUT_DIR)/$(APP_NAME).exe
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) \
+	CC=$(CC) CXX=$(CXX) \
+	CGO_CFLAGS=$(CGO_CFLAGS) \
+	CGO_LDFLAGS=$(CGO_LDFLAGS) \
+	$(GO) build -ldflags="-s -w" -o $(OUT_DIR)/$(APP_NAME).exe
 	@echo "Build with icon complete: $(OUT_DIR)/$(APP_NAME).exe"
 
 # Compile icon resource file
@@ -71,7 +80,7 @@ icon.rc:
 requirements:
 	@echo "Required build tools:"
 	@echo "- golang"
-	@echo "- gcc-mingw-w64"
+	@echo "- gcc-mingw-w64-posix"
 	@echo "- libgl1-mesa-dev"
 	@echo "- xorg-dev"
 
