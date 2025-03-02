@@ -108,8 +108,8 @@ func main() {
 	fmt.Println("Press Ctrl+C to stop recording and save...")
 
 	// Audio settings
-	sampleRate := 44100
-	channels := 2
+	sampleRate := 16000
+	channels := 1
 
 	// Create recorder configuration
 	config := audio.RecordingConfig{
